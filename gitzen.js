@@ -127,13 +127,20 @@ async function cmdSave() {
 
   let msg = await ask('\nCommit message (press Enter to auto-generate): ');
   if (!msg) {
-    msg = `Update ${files.length} file${files.length > 1 ? 's' : ''}`;
+    // If we are in the middle of a merge, Git requires a specific commit flow.
+    // But a standard commit message works fine to finish it.
+    msg = `Merge and update ${files.length} file${files.length > 1 ? 's' : ''}`;
     info(`Auto-generated message: "${msg}"`);
   }
 
   info('Staging and committing locally...');
   runGit('add .');
-  const commitRes = runGit(`commit -m "${msg.replace(/"/g, '\\"')}"`, true);
+  
+  // Check if we are finishing a merge
+  const isMerging = fs.existsSync(path.join(process.cwd(), '.git', 'MERGE_HEAD'));
+  let commitCmd = isMerging ? `commit --no-edit` : `commit -m "${msg.replace(/"/g, '\\"')}"`;
+  
+  const commitRes = runGit(commitCmd, true);
   
   if (!commitRes.success) {
     error('Commit failed: ' + commitRes.output);
@@ -141,6 +148,9 @@ async function cmdSave() {
   }
 
   success(`Successfully saved locally! 💾`);
+  if (isMerging) {
+    success('Merge completed successfully!');
+  }
   info('Your code is safe on your computer. Run "push" when you are ready to sync to GitHub.');
 }
 
@@ -161,14 +171,11 @@ async function cmdPush() {
   const branch = getCurrentBranch();
   info(`Pushing branch '${branch}' to GitHub... (please wait)`);
   
-  // 🐛 BUG FIX: We MUST use silent=true here so Node captures the error text.
-  // If we don't, the error prints to the screen but Node can't "read" it to check for the word 'rejected'.
   const pushRes = runGit(`push -u origin ${branch}`, true); 
   
   if (pushRes.success) {
     success(`Successfully synced with GitHub! 🎉`);
   } else {
-    // NOW this check will actually work because pushRes.output contains the Git error text!
     if (pushRes.output.includes('rejected') || pushRes.output.includes('fetch first') || pushRes.output.includes('non-fast-forward') || pushRes.output.includes('Updates were rejected')) {
       warn('Push rejected! GitHub has files that we don\'t have locally.');
       log('This happens if you created a README on GitHub, or someone else pushed code.', c.gray);
@@ -180,7 +187,6 @@ async function cmdPush() {
       ]);
       
       if (fixChoice === 0) {
-        // OPTION 1: SMART MERGE
         const fixed = await smartMerge(branch);
         if (fixed) {
           info('Now trying to push again...');
@@ -193,7 +199,6 @@ async function cmdPush() {
           }
         }
       } else if (fixChoice === 1) {
-        // OPTION 2: OVERWRITE (FORCE PUSH)
         log('\n💥 OVERWRITE MODE 💥', c.bold + c.red);
         warn('This will permanently replace the GitHub repository with your local files.');
         log('Any files that exist on GitHub but not on your computer will be deleted online.', c.gray);
@@ -240,20 +245,42 @@ async function smartMerge(branch) {
   
   if (pullRes.output.includes('CONFLICT') || pullRes.output.includes('could not apply')) {
     error('Uh oh! You and GitHub edited the exact same lines in a file.');
-    log('\nGitZen can\'t auto-fix file content conflicts, but here is how to fix it:', c.yellow);
-    log('  1. Open your code editor (like VS Code).', c.gray);
-    log('  2. Look for files marked with "Conflicts".', c.gray);
-    log('  3. Choose which code to keep, save the file.', c.gray);
-    log('  4. Run "node gitzen.js save" and then "push" again.', c.gray);
     
-    runGit('merge --abort', true);
-    return false;
+    log('\n🛑 GitZen is pausing. You need to fix this in VS Code:', c.bold + c.yellow);
+    log('  1. Open VS Code. You will see files marked with "C" (Conflicts) in the Source Control tab.', c.gray);
+    log('  2. Open the conflicted file. Look for the yellow/green blocks.', c.gray);
+    log('  3. Click "Accept Current Change" (your code) or "Accept Incoming Change" (GitHub code).', c.gray);
+    log('  4. Save the file (Ctrl+S / Cmd+S).', c.gray);
+    log('  5. Come back here and run "node gitzen.js save" to finish the merge!', c.gray);
+    log('\n💡 If you panic and want to cancel this merge, run "node gitzen.js abort".', c.cyan);
+    
+    // 🐛 BUG FIX: REMOVED `runGit('merge --abort', true);` 
+    // We MUST leave the files in the conflicted state so the user can fix them in VS Code!
+    return false; 
   }
 
   error('Smart Merge failed for an unknown reason.');
   log(pullRes.output, c.gray);
   runGit('merge --abort', true);
   return false;
+}
+
+// ==========================================
+// 🆕 NEW: ABORT COMMAND (The "Panic Button")
+// ==========================================
+async function cmdAbort() {
+  log('\n🛑 Aborting messy merge/pull...\n', c.bold);
+  
+  warn('This will cancel the current merge and revert your files to how they were before the pull.');
+  const confirm = await ask('Are you sure? Type "yes" to abort: ');
+  
+  if (confirm.toLowerCase() === 'yes') {
+    runGit('merge --abort', true);
+    runGit('rebase --abort', true);
+    success('Merge aborted! Your files are back to normal.');
+  } else {
+    info('Abort cancelled.');
+  }
 }
 
 async function cmdUndo() {
@@ -332,13 +359,15 @@ async function main() {
   if (action === 'push') return cmdPush();
   if (action === 'undo') return cmdUndo();
   if (action === 'history') return cmdHistory();
+  if (action === 'abort') return cmdAbort();
 
   // Interactive Menu
   const choice = await selectMenu('What would you like to do?', [
-    '💾 Save (Local Commit)',
+    '💾 Save (Local Commit / Finish Merge)',
     '🚀 Push (Sync to GitHub)',
     '⏪ Undo (Revert to previous save)',
     '📜 History (View past saves)',
+    '🛑 Abort (Cancel a messy merge/pull)',
     '🛠️  Setup (Re-configure GitHub/Ignore)'
   ]);
 
@@ -346,7 +375,8 @@ async function main() {
   else if (choice === 1) await cmdPush();
   else if (choice === 2) await cmdUndo();
   else if (choice === 3) await cmdHistory();
-  else if (choice === 4) await cmdSetup();
+  else if (choice === 4) await cmdAbort();
+  else if (choice === 5) await cmdSetup();
   
   rl.close();
 }
